@@ -342,6 +342,35 @@ pytest tests/ -v
 
 ---
 
+## Roadmap
+
+Progress against the [whitepaper §8 Recommended Roadmap](WHITEPAPER.md#8-recommended-roadmap):
+
+### Phase 1 — Make the reference implementation trainable ✅ Complete
+
+- [x] Add causal mask to SSA forward
+- [x] Add autoregressive loss computation
+- [x] Wire in a tokeniser + small training corpus (`opensubq/data.py`)
+- [x] Write a minimal training loop with bfloat16, AdamW, checkpointing (`train.py`)
+- [x] Train a tiny sanity-check model to verify loss decreases
+
+### Phase 2 — Scale to Tier 1 (7 B, single A100)
+
+- [ ] Add `torch.compile` and bfloat16 inference
+- [ ] Integrate FlashAttention-2 for the local-window component
+- [ ] Add KV-cache for autoregressive decoding
+- [ ] Train `SubQConfig.mistral_7b()` on a mid-scale dataset
+
+### Phase 3 — Scale to Tier 2 (MiMo-V2-Flash, cluster)
+
+- [ ] Replace sequential expert dispatch with batched GEMM / megablocks
+- [ ] Add auxiliary load-balancing loss
+- [ ] Integrate an expert-parallel training framework
+- [ ] Add tensor + pipeline parallelism for 309 B total weight distribution
+- [ ] Train `SubQConfig.mimo_v2_flash()` on a large-scale dataset
+
+---
+
 ## Disclaimer
 
 This repository is an **independent theoretical reconstruction** of the SubQ
