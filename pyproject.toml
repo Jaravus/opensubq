@@ -17,6 +17,9 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+train = [
+    "tiktoken>=0.6",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
