@@ -27,7 +27,7 @@ import torch.nn as nn
 
 from .attention import SubquadraticSparseAttention
 from .config import SubQConfig
-from .layers import SubQMLP, SubQRMSNorm
+from .layers import SubQMLP, SubQRMSNorm, SparseMoEMLP
 
 
 class SubQTransformerLayer(nn.Module):
@@ -44,7 +44,9 @@ class SubQTransformerLayer(nn.Module):
         self.attn_norm = SubQRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attn      = SubquadraticSparseAttention(config)
         self.mlp_norm  = SubQRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp       = SubQMLP(config)
+        self.mlp = (
+            SparseMoEMLP(config) if config.num_experts is not None else SubQMLP(config)
+        )
         self.drop      = nn.Dropout(config.dropout)
 
     def forward(

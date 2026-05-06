@@ -152,6 +152,7 @@ class SubquadraticSparseAttention(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads  # type: ignore[assignment]
         self.head_dim = config.head_dim  # type: ignore[assignment]
         self.window_size = config.window_size
         self.num_global_tokens = config.num_global_tokens
@@ -159,10 +160,12 @@ class SubquadraticSparseAttention(nn.Module):
         self.routing_rank = config.routing_rank
         self.scale = self.head_dim ** -0.5
 
-        # Standard Q / K / V / output projections
+        kv_proj_size = self.num_kv_heads * self.head_dim
+
+        # Q uses full head count; K/V use the (potentially smaller) KV head count.
         self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, kv_proj_size, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, kv_proj_size, bias=False)
         self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
 
         # Low-rank routing projections for content-based sparse attention.
@@ -184,9 +187,28 @@ class SubquadraticSparseAttention(nn.Module):
     # ------------------------------------------------------------------ #
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
-        """(B, N, D) → (B, N, H, d)"""
+        """(B, N, D) → (B, N, H, d)  for query projections."""
         B, N, _ = x.shape
         return x.view(B, N, self.num_heads, self.head_dim)
+
+    def _split_heads_kv(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, N, num_kv_heads * head_dim) → (B, N, num_kv_heads, head_dim)."""
+        B, N, _ = x.shape
+        return x.view(B, N, self.num_kv_heads, self.head_dim)
+
+    @staticmethod
+    def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """
+        Expand KV heads from (B, N, H_kv, d) to (B, N, H_q, d).
+
+        Each KV head is repeated ``n_rep`` times so it is shared by the
+        corresponding group of query heads.  When ``n_rep == 1`` (standard
+        MHA) the input is returned unchanged.
+        """
+        if n_rep == 1:
+            return x
+        B, N, H, d = x.shape
+        return x.unsqueeze(3).expand(B, N, H, n_rep, d).reshape(B, N, H * n_rep, d)
 
     def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
         """(B, N, H, d) → (B, N, D)"""
@@ -274,13 +296,18 @@ class SubquadraticSparseAttention(nn.Module):
         device = hidden_states.device
 
         # ---- Projections --------------------------------------------------- #
-        q = self._split_heads(self.q_proj(hidden_states))  # (B, N, H, d)
-        k = self._split_heads(self.k_proj(hidden_states))
-        v = self._split_heads(self.v_proj(hidden_states))
+        q = self._split_heads(self.q_proj(hidden_states))        # (B, N, H_q,  d)
+        k = self._split_heads_kv(self.k_proj(hidden_states))     # (B, N, H_kv, d)
+        v = self._split_heads_kv(self.v_proj(hidden_states))     # (B, N, H_kv, d)
 
         # ---- Rotary position embeddings ------------------------------------ #
         cos, sin = self.rotary(N, device)
         q, k = apply_rotary_emb(q, k, cos, sin)
+
+        # ---- Expand KV heads to match Q heads (GQA → MHA view) ------------ #
+        n_rep = self.num_heads // self.num_kv_heads
+        k = self._repeat_kv(k, n_rep)   # (B, N, H_q, d)
+        v = self._repeat_kv(v, n_rep)   # (B, N, H_q, d)
 
         # ---- Build combined SSA boolean mask ------------------------------- #
         local_mask = self._local_mask(N, device)          # (N, N)

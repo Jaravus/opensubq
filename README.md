@@ -168,8 +168,11 @@ logits (B, N, V)
 | `vocab_size`            | 50 257        | GPT-2 vocabulary                   |
 | `hidden_size`           | 768           | Token embedding / hidden dimension |
 | `num_hidden_layers`     | 12            | Number of transformer blocks       |
-| `num_attention_heads`   | 12            | Attention heads                    |
-| `intermediate_size`     | 3 072         | MLP inner dimension                |
+| `num_attention_heads`   | 12            | Attention heads (query)            |
+| `num_key_value_heads`   | same as Q     | KV heads — set < Q heads for GQA  |
+| `intermediate_size`     | 3 072         | FFN inner dim (per expert for MoE) |
+| `num_experts`           | `None`        | MoE expert count; `None` = dense   |
+| `num_experts_per_tok`   | 1             | Active experts per token (top-K)   |
 | `window_size`           | 512           | Local attention half-width         |
 | `num_global_tokens`     | 64            | Number of global-sink tokens       |
 | `top_k_sparse`          | 128           | Top-K content routing connections  |
@@ -187,6 +190,57 @@ pip install -e ".[dev]"   # from the repo root (editable + test deps)
 ```
 
 Requires Python ≥ 3.10 and PyTorch ≥ 2.2.
+
+---
+
+## Model Scales
+
+The repository ships two named `SubQConfig` presets that target distinct
+deployment tiers.
+
+### Tier 1 — Mistral 7B scale  *(single A100 80 GB)*
+
+Matches the hyper-parameters of Mistral 7B: 32-layer decoder, hidden size
+4 096, SwiGLU FFN with inner dim 14 336.  Uses **Grouped Query Attention**
+(32 Q heads / 8 KV heads) to halve the KV-cache footprint compared to
+standard MHA.  SubQ's SSA replaces Mistral's fixed sliding-window attention,
+adding global-sink tokens and content routing on top of the local window.
+
+```python
+from opensubq import SubQConfig, SubQModel
+
+config = SubQConfig.mistral_7b()
+# hidden_size=4096, 32 layers, 32 Q / 8 KV heads, dense SwiGLU FFN
+# vocab_size=32_000  (Mistral tokeniser)
+print(config)
+```
+
+### Tier 2 — MiMo-V2-Flash scale  *(multi-GPU cluster)*
+
+Matches the backbone dimensions of MiMo-V2-Flash (Xiaomi, 2025): 48-layer
+decoder, hidden size 7 168, 64 Q heads / 8 KV heads.  The dense FFN is
+replaced by a **256-expert Sparse MoE** (8 experts active per token via
+top-K routing), giving ~15 B active parameters per forward pass out of ~309 B
+total.  SubQ's SSA is applied uniformly to every layer, providing the same
+O(1)-hop global connectivity as MiMo's interleaved full-attention layers but
+at linear cost.
+
+```python
+from opensubq import SubQConfig, SubQModel
+
+config = SubQConfig.mimo_v2_flash()
+# hidden_size=7168, 48 layers, 64 Q / 8 KV heads
+# 256 experts / 8 active  (SparseMoEMLP per layer)
+# vocab_size=152_064  (Qwen3 tokeniser)
+print(config)
+```
+
+### Parameter summary
+
+| Preset | Scale | Layers | Hidden | Q / KV heads | FFN | Vocab |
+|---|---|---|---|---|---|---|
+| `SubQConfig.mistral_7b()` | ~7 B | 32 | 4 096 | 32 / 8 | Dense SwiGLU | 32 000 |
+| `SubQConfig.mimo_v2_flash()` | ~15 B active / 309 B total | 48 | 7 168 | 64 / 8 | Sparse MoE 256 ×, top-8 | 152 064 |
 
 ---
 
@@ -252,3 +306,6 @@ described in the company's public blog post.
 | [RMSNorm (Zhang & Sennrich, 2019)](https://arxiv.org/abs/1910.07467) | Root Mean Square normalisation |
 | [FlashAttention (Dao et al., 2022)](https://arxiv.org/abs/2205.14135) | Memory-efficient exact attention (production baseline) |
 | [Efficient Transformers Survey (Tay et al., 2020)](https://arxiv.org/abs/2009.06732) | Survey of sub-quadratic attention approaches |
+| [GQA (Ainslie et al., 2023)](https://arxiv.org/abs/2305.13245) | Grouped Query Attention — fewer KV heads than Q heads |
+| [MiMo-V2-Flash (Xiaomi, 2025)](https://arxiv.org/abs/2601.02780) | 309B MoE model; inspiration for the `mimo_v2_flash` scale preset |
+| [Mistral 7B (Jiang et al., 2023)](https://arxiv.org/abs/2310.06825) | Dense 7B baseline; inspiration for the `mistral_7b` scale preset |
