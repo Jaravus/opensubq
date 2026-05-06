@@ -186,7 +186,8 @@ logits (B, N, V)
 ## Install
 
 ```bash
-pip install -e ".[dev]"   # from the repo root (editable + test deps)
+pip install -e ".[dev]"          # editable install + test deps (no extra deps)
+pip install -e ".[dev,train]"    # also installs tiktoken for GPT-2/4 BPE datasets
 ```
 
 Requires Python ≥ 3.10 and PyTorch ≥ 2.2.
@@ -275,11 +276,69 @@ print(logits.shape)
 
 ---
 
+## Data & Training
+
+### Data pipeline (`opensubq/data.py`)
+
+| Class / helper | Description |
+|---|---|
+| `CharDataset` | Byte-level (0–255) tokenisation; no extra deps; matches `vocab_size=256` tiny config |
+| `TiktokenDataset` | GPT-2 / GPT-4 BPE via `tiktoken`; requires `pip install tiktoken` |
+| `make_synthetic_datasets()` | Reproducible random-token corpus for tests and quick demos |
+| `make_split_loaders()` | Returns a `(train_loader, val_loader)` pair |
+
+Both dataset classes produce `(input_ids, labels)` tensors with the autoregressive shift baked in and compatible with `SubQModel.forward(input_ids, labels=labels)`.
+
+```python
+from opensubq.data import CharDataset, make_split_loaders
+
+# From a plain-text file (byte-level tokenisation):
+train_ds, val_ds = CharDataset.from_file("corpus.txt", seq_len=1024)
+train_loader, val_loader = make_split_loaders(train_ds, val_ds, batch_size=8)
+
+# Or use GPT-2 BPE (requires tiktoken):
+from opensubq.data import TiktokenDataset
+train_ds, val_ds = TiktokenDataset.from_file("corpus.txt", seq_len=1024, encoding="gpt2")
+```
+
+### Training loop (`train.py`)
+
+A ready-to-run training script at the repo root.  Features:
+
+- `torch.autocast` mixed-precision — **bfloat16** on CUDA, float32 on CPU
+- **AdamW** with cosine LR schedule and linear warmup (`--warmup-frac`)
+- Gradient clipping (`--grad-clip`, default 1.0)
+- Checkpoint save / resume (`--checkpoint-dir`, `--resume`)
+- Eval loss on held-out val split, optional CSV loss log (`--log-file`)
+
+```bash
+# Sanity-check: tiny model, synthetic data, CPU, ~5 s:
+python train.py --preset tiny --data synthetic --max-steps 100
+
+# Tier-1 training on a real corpus:
+python train.py \
+    --preset mistral_7b \
+    --data file --data-file corpus.txt \
+    --seq-len 4096 --batch-size 4 \
+    --max-steps 100000 \
+    --checkpoint-dir ./ckpts \
+    --log-file loss.csv
+
+python train.py --help   # full option list
+```
+
+**Presets:** `tiny` (64-dim, 2L, vocab 256), `mistral_7b`, `mimo_v2_flash`.
+
+---
+
 ## Tests
 
 ```bash
 pytest tests/ -v
 ```
+
+109 tests across attention, model, data pipeline, and training loop.
+`TiktokenDataset` tests are automatically skipped when `tiktoken` is not installed.
 
 ---
 
