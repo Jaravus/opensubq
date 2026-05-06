@@ -46,10 +46,11 @@ to a real-world frontier model at that scale:
 | 1 | `SubQConfig.mistral_7b()` | Single A100 80 GB | ~7 B params, dense FFN, GQA |
 | 2 | `SubQConfig.mimo_v2_flash()` | Multi-GPU cluster | ~15 B active / 309 B total, 256-expert MoE, GQA |
 
-The codebase is correct, tested (73 passing tests), and structured to allow a
-clear path to production.  The primary remaining work involves replacing the
-reference dense-mask implementation of SSA with block-sparse CUDA kernels, and
-adding training infrastructure (data pipeline, checkpointing, distributed
+The codebase is correct, tested (88 passing tests), and structured to allow a
+clear path to production.  Phase 0 correctness work (causal masking and
+autoregressive loss) is complete.  The primary remaining work involves replacing
+the reference dense-mask implementation of SSA with block-sparse CUDA kernels,
+and adding training infrastructure (data pipeline, checkpointing, distributed
 training, evaluation).
 
 ---
@@ -88,14 +89,18 @@ token** context window at roughly 1/5 the cost of comparable dense models.
 **File:** `opensubq/attention.py`
 
 SSA replaces the full N×N attention matrix with a **union of three Boolean
-sparse masks**.  Only token pairs selected by at least one mask participate
-in attention:
+sparse masks**, then ANDs the result with a lower-triangular causal mask when
+`causal=True` (the default):
 
 ```
-SSA_mask[i, j] = local_mask[i, j]    # local window
-               | global_mask[i, j]   # global sinks
-               | routing_mask[i, j]  # content routing
+SSA_mask[i, j] = (local_mask[i, j]     # local window
+                | global_mask[i, j]    # global sinks
+                | routing_mask[i, j])  # content routing
+               &  causal_mask[i, j]   # j ≤ i  (when causal=True)
 ```
+
+Only token pairs selected by at least one structural mask **and** not blocked
+by the causal gate participate in attention.
 
 #### Pattern 1 — Local Window  (cost: O(N · W))
 
@@ -129,6 +134,12 @@ keys for each query:
 route_scores[b, h, i, j] = route_q(x)[b,i,h,:] · route_k(x)[b,j,h,:]ᵀ
 routing_mask[b, h, i, :]  = top-K positions of route_scores[b, h, i, :]
 ```
+
+When `causal=True`, future key positions are masked to −∞ in `route_scores`
+**before** the top-K threshold is computed.  This prevents future tokens from
+raising the threshold and silently evicting valid past keys — a subtle leakage
+path that exists in a naïve implementation that only applies the causal mask
+after routing selection.
 
 The routing projections (`route_q`, `route_k`) map hidden states to a
 `routing_rank`-dimensional space per head (`routing_rank=16` by default, far
@@ -221,7 +232,11 @@ self.mlp = SparseMoEMLP(config) if config.num_experts else SubQMLP(config)
 
 - **`SubQModel`** — Full decoder-only LM: token embedding → N ×
   `SubQTransformerLayer` → RMSNorm → LM head.  Supports optional weight tying
-  between the embedding table and the LM head.
+  between the embedding table and the LM head.  Accepts an optional `labels`
+  tensor; when provided, computes a shifted autoregressive cross-entropy loss
+  (position i predicts i+1, `ignore_index=-100`) and returns `(loss, logits)`.
+  When `labels` is omitted the return type is the bare `logits` tensor,
+  preserving backward compatibility.
 
 ### 3.5 Named scale presets
 
@@ -250,7 +265,8 @@ x  (B, N, D)
 │       ├─ k_proj  → (B, N, H_kv·d) → split  → (B, N, H_kv, d) → repeat → (B, N, H_q, d)
 │       ├─ v_proj  → same as k
 │       ├─ RoPE applied to Q, K
-│       ├─ SSA mask = local_mask ∪ global_mask ∪ routing_mask   [bool, (B, H_q, N, N)]
+│       ├─ routing_scores pre-masked to lower-tri before top-K  (causal=True)
+│       ├─ SSA_mask = (local ∪ global ∪ routing) ∩ causal_tril  [bool, (B, H_q, N, N)]
 │       ├─ scores = Q_t · K_tᵀ * scale                           [(B, H_q, N, N)]
 │       ├─ scores[~SSA_mask] = -inf
 │       ├─ attn_weights = softmax(scores)
@@ -280,10 +296,11 @@ x  (B, N, D)
 | Sparse MoE FFN | ✅ Correct | Sequential expert dispatch; needs batched dispatch for speed |
 | RoPE | ✅ Correct | Lazy cache; arbitrary sequence lengths |
 | RMSNorm | ✅ Correct | float32 stability |
-| Full model forward pass | ✅ Correct | Logits verified, no NaN |
+| Causal masking | ✅ Correct | Lower-tri AND applied to all three SSA patterns; routing threshold pre-masked |
+| Autoregressive (LM) loss | ✅ Correct | Shifted cross-entropy in `SubQModel.forward`; `ignore_index=-100` |
+| Full model forward pass | ✅ Correct | Logits and loss verified, no NaN |
 | Named presets | ✅ Present | `mistral_7b()`, `mimo_v2_flash()` |
-| Test suite | ✅ 73 tests, all passing | |
-| Causal masking | ❌ Missing | Current SSA is bidirectional; need autoregressive triangular mask |
+| Test suite | ✅ 88 tests, all passing | |
 | Training loop | ❌ Missing | |
 | Data pipeline | ❌ Missing | |
 | Checkpointing / resume | ❌ Missing | |
@@ -291,13 +308,24 @@ x  (B, N, D)
 | Block-sparse CUDA kernels | ❌ Missing | Required for long-context production use |
 | Distributed training | ❌ Missing | Required for Tier 2 |
 
-### Key correctness note: causal masking
+### Phase 0 completed
 
-The current implementation does **not** apply a causal (autoregressive)
-triangular mask.  For language model training, position i should only attend to
-positions j ≤ i.  This must be added before training begins.  The fix is
-straightforward — AND the SSA boolean mask with a lower-triangular causal mask
-before the masked fill.
+Causal masking and autoregressive loss computation were added as the first
+correctness milestone (Phase 0).  Two correctness subtleties were addressed:
+
+1. **Routing threshold leakage** — future keys were masked to −∞ in
+   `_routing_mask` *before* `topk`, not after.  A naïve post-hoc causal AND
+   would still allow future tokens to raise the threshold and silently evict
+   valid past keys from the routing mask.
+
+2. **Causal mask cache** — a lazily extended lower-triangular cache
+   (mirroring the `RotaryEmbedding` cache pattern) avoids reallocating the
+   causal tensor on every forward pass.
+
+The `route_q` / `route_k` weights intentionally receive no gradient in this
+reference implementation because the boolean top-K mask is non-differentiable.
+A production deployment would replace the hard top-K with a soft or
+straight-through estimator to make routing weights trainable.
 
 ---
 
@@ -382,33 +410,33 @@ matrix.
 These items must be completed before a Tier 1 training run makes sense.  They
 are ordered by dependency.
 
-#### P0 — Correctness (no training will converge without these)
+#### P0 — Correctness  ✅ Complete
 
-**1. Add causal masking to SSA**
+**1. ~~Add causal masking to SSA~~ — Done**
 
-The SSA mask must be ANDed with a lower-triangular causal mask so that position
-i cannot attend to positions j > i.  Without this the model sees future tokens
-during training and the learned probability distribution is invalid.
-
-```python
-# In SubquadraticSparseAttention.forward:
-causal = torch.tril(torch.ones(N, N, dtype=torch.bool, device=device))
-ssa_mask = ssa_mask & causal.unsqueeze(0).unsqueeze(0)
-```
-
-Estimated effort: < 1 day.
-
-**2. Cross-entropy training loss**
-
-The current `SubQModel.forward` returns raw logits.  A training wrapper needs
-to accept `labels` and compute cross-entropy loss, shifting logits by one
-position for autoregressive prediction:
+The SSA mask is now ANDed with a lower-triangular causal mask so that position
+i cannot attend to positions j > i.  The routing threshold is also pre-masked
+to prevent future keys from influencing the top-K selection.  `SubQConfig`
+exposes a `causal: bool = True` flag to toggle this behaviour.
 
 ```python
-loss = cross_entropy(logits[:, :-1].reshape(-1, V), labels[:, 1:].reshape(-1))
+# In SubquadraticSparseAttention.forward (causal=True, the default):
+ssa_mask = ssa_mask & self._causal_mask(N, device).unsqueeze(0).unsqueeze(0)
 ```
 
-Estimated effort: < 1 day.
+**2. ~~Cross-entropy training loss~~ — Done**
+
+`SubQModel.forward` now accepts a `labels` tensor and computes the shifted
+autoregressive cross-entropy loss, returning `(loss, logits)`:
+
+```python
+loss, logits = model(input_ids, labels=input_ids)
+loss.backward()
+```
+
+Token positions with `labels == -100` are excluded from the loss
+(`ignore_index=-100`).  When `labels` is omitted the return type is the bare
+`logits` tensor, preserving backward compatibility.
 
 #### P1 — Training infrastructure (required for actual pre-training)
 
@@ -527,8 +555,8 @@ Estimated effort: 1–2 weeks with Megatron-LM or FSDP2.
 
 ### Phase 1 — Make the reference implementation trainable (1–2 weeks)
 
-1. Add causal mask to SSA forward (P0, §7.1 item 1)
-2. Add autoregressive loss computation (P0, §7.1 item 2)
+1. ~~Add causal mask to SSA forward~~ ✅ Done (Phase 0)
+2. ~~Add autoregressive loss computation~~ ✅ Done (Phase 0)
 3. Wire in a tokeniser + small training corpus (P1, §7.1 item 3)
 4. Write a minimal training loop with bfloat16, AdamW, checkpointing (P1, §7.1
    item 4)
