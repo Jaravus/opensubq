@@ -20,10 +20,11 @@ attention cost instead of O(N²).
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .attention import SubquadraticSparseAttention
 from .config import SubQConfig
@@ -138,16 +139,24 @@ class SubQModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        labels: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Parameters
         ----------
         input_ids      : (B, N)  integer token ids.
         attention_mask : (B, N)  1 = real token, 0 = padding (optional).
+        labels         : (B, N)  integer token ids for language-model loss
+                         (optional).  When provided the loss is computed with a
+                         one-position left shift so that position i predicts
+                         position i+1 (standard autoregressive cross-entropy).
+                         Token positions where ``labels == -100`` are ignored.
 
         Returns
         -------
-        logits : (B, N, vocab_size)
+        logits : (B, N, vocab_size)  — when ``labels`` is ``None``.
+        (loss, logits) : scalar CE loss and (B, N, vocab_size) logits
+                         — when ``labels`` is provided.
         """
         hidden_states = self.embed_tokens(input_ids)   # (B, N, D)
 
@@ -155,7 +164,21 @@ class SubQModel(nn.Module):
             hidden_states = layer(hidden_states, attention_mask=attention_mask)
 
         hidden_states = self.norm(hidden_states)        # (B, N, D)
-        return self.lm_head(hidden_states)              # (B, N, V)
+        logits = self.lm_head(hidden_states)            # (B, N, V)
+
+        if labels is None:
+            return logits
+
+        # Autoregressive loss: shift so that token i predicts token i+1.
+        # logits[:, :-1] predicts labels[:, 1:]
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+        return loss, logits
 
     # ------------------------------------------------------------------ #
     # Utility                                                              #

@@ -104,6 +104,11 @@ class SubQConfig:
     attention_dropout: float = 0.0
 
     # ------------------------------------------------------------------ #
+    # Autoregressive / causal settings
+    # ------------------------------------------------------------------ #
+    causal: bool = True   # AND SSA mask with torch.tril() during training and inference
+
+    # ------------------------------------------------------------------ #
     # Normalisation / initialisation
     # ------------------------------------------------------------------ #
     rms_norm_eps: float = 1e-6

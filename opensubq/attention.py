@@ -158,6 +158,7 @@ class SubquadraticSparseAttention(nn.Module):
         self.num_global_tokens = config.num_global_tokens
         self.top_k_sparse = config.top_k_sparse
         self.routing_rank = config.routing_rank
+        self.causal = config.causal
         self.scale = self.head_dim ** -0.5
 
         kv_proj_size = self.num_kv_heads * self.head_dim
@@ -181,6 +182,10 @@ class SubquadraticSparseAttention(nn.Module):
         )
 
         self.attn_drop = nn.Dropout(config.attention_dropout)
+
+        # Cached causal mask — extended lazily as sequence length grows.
+        self._causal_seq_len_cached: int = 0
+        self._causal_mask_cached: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------ #
     # Helpers                                                              #
@@ -244,6 +249,23 @@ class SubquadraticSparseAttention(nn.Module):
         mask[:G, :] = True   # the G global queries may attend to every token
         return mask
 
+    def _causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """
+        Lower-triangular boolean mask — True where j ≤ i (causal positions).
+
+        Shape: (seq_len, seq_len).  The cache is extended lazily so that
+        repeated calls with the same or smaller sequence length are free.
+        """
+        if seq_len > self._causal_seq_len_cached or (
+            self._causal_mask_cached is not None
+            and self._causal_mask_cached.device != device
+        ):
+            self._causal_seq_len_cached = seq_len
+            self._causal_mask_cached = torch.tril(
+                torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
+            )
+        return self._causal_mask_cached[:seq_len, :seq_len]  # type: ignore[index]
+
     def _routing_mask(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Content-based top-K sparse mask.
@@ -253,6 +275,11 @@ class SubquadraticSparseAttention(nn.Module):
         Each query position selects its top-K key positions according to a
         low-rank routing score (route_q · route_k^T).  This introduces
         content-dependent long-range connections without a full N² enumeration.
+
+        When ``causal=True`` (the default), future key positions are masked out
+        *before* the top-K threshold is computed, so they cannot raise or lower
+        the threshold for past positions and do not affect which causal keys are
+        selected.
 
         In a production system the routing scores would be evaluated with an
         approximate nearest-neighbour index (e.g. FAISS, ScaNN) to keep the
@@ -268,6 +295,17 @@ class SubquadraticSparseAttention(nn.Module):
 
         # Routing similarity scores: (B, H, N, N)
         routing_scores = torch.matmul(rq, rk.transpose(-2, -1))
+
+        # When causal=True, zero out future positions before selecting top-K so
+        # future keys never influence the routing threshold for earlier queries.
+        # The final causal AND in forward() also blocks future positions for any
+        # query that has fewer than K causal predecessors (e.g. position 0).
+        if self.causal:
+            causal = self._causal_mask(N, hidden_states.device)
+            routing_scores = routing_scores.masked_fill(
+                ~causal.unsqueeze(0).unsqueeze(0),
+                torch.finfo(routing_scores.dtype).min,
+            )
 
         # Select top-K per query (last dimension = keys)
         threshold = routing_scores.topk(K, dim=-1).values[..., -1:]   # (B, H, N, 1)
@@ -320,6 +358,13 @@ class SubquadraticSparseAttention(nn.Module):
             | global_mask.unsqueeze(0).unsqueeze(0) # (1, 1, N, N)
             | routing_mask                          # (B, H, N, N)
         )  # → (B, H, N, N) via broadcast
+
+        # Causal masking: token i may only attend to positions j ≤ i.
+        # AND the SSA union mask with a lower-triangular causal mask so that
+        # no future token is visible regardless of which sparse pattern
+        # would otherwise connect it.
+        if self.causal:
+            ssa_mask = ssa_mask & self._causal_mask(N, device).unsqueeze(0).unsqueeze(0)
 
         # ---- Attention scores ---------------------------------------------- #
         q_t = q.transpose(1, 2)    # (B, H, N, d)
