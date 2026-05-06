@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+opensubq/__init__.py
+opensubq/attention.py
+opensubq/config.py
+opensubq/layers.py
+opensubq/model.py
+opensubq.egg-info/PKG-INFO
+opensubq.egg-info/SOURCES.txt
+opensubq.egg-info/dependency_links.txt
+opensubq.egg-info/requires.txt
+opensubq.egg-info/top_level.txt
+tests/test_attention.py
+tests/test_model.py
